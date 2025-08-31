@@ -1,0 +1,4 @@
+streamlit>=1.22
+pandas>=1.5
+requests>=2.31
+tzdata>=2023.3  # helps ZoneInfo on Windows/containers
