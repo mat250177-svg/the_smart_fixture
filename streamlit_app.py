@@ -49,25 +49,25 @@ def poisson_prob(lmbda, k):
     return math.exp(-lmbda) * (lmbda ** k) / math.factorial(k)
 
 def match_probs(lambda_home, lambda_away, max_goals=10):
-    # precompute PMFs; normalize defensively
-    ph = [poisson_prob(lambda_home,},{"hg":2,"ag":1},{"hg":1,"ag":1}],
-    },
-    ("Man City","Newcastle"): {
-        "home_home": [{"gf":4,"ga":1},{"gf":2,"ga":0},{"gf":5,"ga":2},{"gf":1,"ga":0},{"gf":3,"ga":1}],
-        "away_away": [{"gf":1,"ga":1},{"gf":0,"ga":1},{"gf":2,"ga":2},{"gf":1,"ga":3},{"gf":0,"ga":0}],
-        "h2h": [{"hg":3,"ag":1},{"hg":2,"ag":0},{"hg":4,"ag":1},{"hg":1,"ag":1},{"hg":2,"ag":2}],
-    },
-    ("Real Madrid","Sevilla"): {
-        "home_home": [{"gf":2,"ga":0},{"gf":1,"ga":0},{"gf":2,"ga":1},{"gf":3,"ga":1},{"gf":2,"ga":0}],
-        "away_away": [{"gf":1,"ga":2},{"gf":0,"ga":2},{"gf":2,"ga":2},{"gf":1,"ga":1},{"gf":0,"ga":1}],
-        "h2h": [{"hg":2,"ag":0},{"hg":1,"ag":1},{"hg":2,"ag":1},{"hg":3,"ag":1},{"hg":1,"ag":0}],
-    },
-    ("Barcelona","Valencia"): {
-        "home_home": [{"gf":3,"ga":0},{"gf":2,"ga":1},{"gf":2,"ga":0},{"gf":1,"ga":0},{"gf":4,"ga":2}],
-        "away_away": [{"gf":1,"ga":1},{"gf":0,"ga":1},{"gf":1,"ga":2},{"gf":2,"ga":2},{"gf":1,"ga":0}],
-        "h2h": [{"hg":2,"ag":1},{"hg":0,"ag":0},{"hg":3,"ag":1},{"hg":2,"ag":0},{"hg":1,"ag":1}],
-    },
-}
+    # Precompute Poisson PMFs and normalize defensively
+    ph = [poisson_prob(lambda_home, h) for h in range(max_goals + 1)]
+    pa = [poisson_prob(lambda_away, a) for a in range(max_goals + 1)]
+    p_home = 0.0
+    p_draw = 0.0
+    p_away = 0.0
+    for h in range(max_goals + 1):
+        for a in range(max_goals + 1):
+            p = ph[h] * pa[a]
+            if h > a:
+                p_home += p
+            elif h == a:
+                p_draw += p
+            else:
+                p_away += p
+    s = p_home + p_draw + p_away
+    if s > 0:
+        p_home, p_draw, p_away = p_home / s, p_draw / s, p_away / s
+    return p_home, p_draw, p_away
 
 TEAM_NEWS = {
     "Arsenal": [{"name":"Player A","yc":2,"s":0},{"name":"Player B","yc":4,"s":1}],
