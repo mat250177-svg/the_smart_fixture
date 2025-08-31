@@ -1,0 +1,1 @@
+# the_smart_fixture
