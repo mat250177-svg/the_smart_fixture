@@ -1,4 +1,4 @@
-# The Smart Fixture (Tablet-Friendly, No CSS)
+# The Smart Fixture (Tablet-Friendly, No CSS, No f-strings)
 # Live fixtures with season + date picker and season-long reel.
 # Uses API-Football if a key is present in Streamlit Secrets; otherwise demo data.
 # ASCII-only, no custom CSS, no f-strings.
@@ -38,7 +38,6 @@ with col1:
 with col2:
     st.title(APP_TITLE)
     st.caption(DISCLAIMER)
-
 st.write("✅ App loaded")
 
 # ---------------- helpers ----------------
@@ -49,7 +48,7 @@ def poisson_prob(lmbda, k):
     return math.exp(-lmbda) * (lmbda ** k) / math.factorial(k)
 
 def match_probs(lambda_home, lambda_away, max_goals=10):
-    # Precompute Poisson PMFs and normalize defensively
+    # precompute PMFs; normalize defensively
     ph = [poisson_prob(lambda_home, h) for h in range(max_goals + 1)]
     pa = [poisson_prob(lambda_away, a) for a in range(max_goals + 1)]
     p_home = 0.0
@@ -62,6 +61,169 @@ def match_probs(lambda_home, lambda_away, max_goals=10):
                 p_home += p
             elif h == a:
                 p_draw += p
+            else:
+                p_away += p
+    s = p_home + p_draw + p_away
+    if s > 0:
+        p_home, p_draw, p_away = p_home / s, p_draw / s, p_away / s
+    return p_home, p_draw, p_away
+
+def fair_odds(p):
+    return (1.0 / p) if p > 0 else float("inf")
+
+def to_london(dt_iso):
+    # Convert API ISO string to Europe/London datetime and label
+    try:
+        t = dt.datetime.fromisoformat(str(dt_iso).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=dt.timezone.utc)
+        if ZoneInfo is not None:
+            t = t.astimezone(ZoneInfo("Europe/London"))
+        return t, t.strftime("%Y-%m-%d"), t.strftime("%a %d %b %H:%M")
+    except Exception:
+        return None, "?", str(dt_iso)
+
+def now_london():
+    try:
+        if ZoneInfo is not None:
+            return dt.datetime.now(ZoneInfo("Europe/London"))
+    except Exception:
+        pass
+    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+
+def today_london_date():
+    try:
+        if ZoneInfo is not None:
+            return dt.datetime.now(ZoneInfo("Europe/London")).date()
+    except Exception:
+        pass
+    return dt.datetime.utcnow().date()
+
+def parse_season(value):
+    s = str(value).strip().replace(" ", "").replace("-", "/")
+    start = s.split("/")[0] if "/" in s else s
+    if not start.isdigit():
+        today = dt.date.today()
+        return today.year if today.month >= 7 else today.year - 1
+    n = int(start)
+    return n + 2000 if n < 100 else n
+
+def form_symbols(results):
+    # simple W D L chips as text for now
+    return " ".join(results)
+
+def wdl_from_rows(rows):
+    out = []
+    for r in rows[-5:]:
+        gf = r.get("gf", 0)
+        ga = r.get("ga", 0)
+        if gf > ga:
+            out.append("W")
+        elif gf < ga:
+            out.append("L")
+        else:
+            out.append("D")
+    return out
+
+def wdl_from_h2h(h2h_rows):
+    home_res, away_res = [], []
+    for r in h2h_rows[-5:]:
+        hg = r.get("hg", 0)
+        ag = r.get("ag", 0)
+        if hg > ag:
+            home_res.append("W")
+            away_res.append("L")
+        elif hg < ag:
+            home_res.append("L")
+            away_res.append("W")
+        else:
+            home_res.append("D")
+            away_res.append("D")
+    return home_res, away_res
+
+# ---------------- LIVE DATA (API-Football) ----------------
+API_KEY = st.secrets.get("API_FOOTBALL_KEY", "")
+DIRECT_HOST = st.secrets.get("API_FOOTBALL_HOST", "v3.football.api-sports.io")
+RAPID_HOST = "api-football-v1.p.rapidapi.com"
+
+def api_providers():
+    # tuple of (base_url, headers)
+    return [
+        ("https://" + DIRECT_HOST, {"x-apisports-key": API_KEY}),
+        ("https://" + RAPID_HOST + "/v3", {"x-rapidapi-key": API_KEY, "x-rapidapi-host": RAPID_HOST}),
+    ]
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def api_get(path, params=None):
+    if (not API_KEY) or (requests is None):
+        return None, "no_key_or_requests", None
+    params = params or {}
+    last_err = None
+    for base_url, hdrs in api_providers():
+        try:
+            r = requests.get(base_url + path, headers=hdrs, params=params, timeout=25)
+            if r.status_code == 200:
+                j = r.json()
+                return j.get("response", []), None, base_url
+            last_err = "{} {} (via {})".format(r.status_code, str(r.text)[:200], base_url)
+        except Exception as e:
+            last_err = "{} (via {})".format(str(e), base_url)
+    return None, last_err or "unknown_error", None
+
+def apifb_countries():
+    resp, err, prov = api_get("/countries")
+    if not resp:
+        return []
+    names = [r.get("name") for r in resp if r.get("name")]
+    out, seen = [], set()
+    for n in names:
+        if n not in seen:
+            out.append(n)
+            seen.add(n)
+    return sorted(out)
+
+def apifb_leagues(country, type_filter):
+    resp, err, prov = api_get("/leagues", {"country": country})
+    resp = resp or []
+    rows = []
+    for item in resp:
+        league = item.get("league", {})
+        if league.get("type") != type_filter:
+            continue
+        rows.append({
+            "id": league.get("id"),
+            "name": league.get("name"),
+            "seasons": item.get("seasons", []),
+        })
+    uniq, seen = [], set()
+    for r in rows:
+        key = (r.get("id"), r.get("name"))
+        if key not in seen:
+            uniq.append(r)
+            seen.add(key)
+    return uniq
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def apifb_fixtures_range(league_id, season_start_year, date_from, date_to):
+    # Ask API for Europe/London timezone
+    resp, err, prov = api_get("/fixtures", {
+        "league": league_id,
+        "season": season_start_year,
+        "from": date_from,
+        "to": date_to,
+        "timezone": "Europe/London",
+    })
+    return (resp or []), err, prov
+
+def season_bounds(season_start_year):
+    # July 1 to June 30 of next year (covers most European leagues)
+    start = dt.date(season_start_year, 7, 1)
+    end = dt.date(season_start_year + 1, 6, 30)
+    return start, end
+
+def apifb_row_basic(r):
+    teams = r.get("teams", {})
+    fixture = r                p_draw += p
             else:
                 p_away += p
     s = p_home + p_draw + p_away
