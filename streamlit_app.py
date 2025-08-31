@@ -1,8 +1,8 @@
-# The Smart Fixture - live fixtures with season + date picker and season-long reel
+# The Smart Fixture (Tablet-Friendly, No CSS)
+# Live fixtures with season + date picker and season-long reel.
 # Uses API-Football if a key is present in Streamlit Secrets; otherwise demo data.
-# ASCII-only, no CSS, no f-strings (tablet-safe).
+# ASCII-only, no custom CSS, no f-strings.
 
-import io
 import json
 import math
 import datetime as dt
@@ -28,16 +28,18 @@ DISCLAIMER = (
     "We do not take bets. Prices change quickly. 18+ | BeGambleAware.org"
 )
 
-# Header
+# ---------------- Header ----------------
 col1, col2 = st.columns([1, 9])
 with col1:
     try:
         st.image("smart_fixture_shield_512_lime.png", width=64)
     except Exception:
-        pass
+        st.write("⚽")
 with col2:
     st.title(APP_TITLE)
-    st.info(DISCLAIMER)
+    st.caption(DISCLAIMER)
+
+st.write("✅ App loaded")
 
 # ---------------- helpers ----------------
 def avg(lst):
@@ -47,262 +49,8 @@ def poisson_prob(lmbda, k):
     return math.exp(-lmbda) * (lmbda ** k) / math.factorial(k)
 
 def match_probs(lambda_home, lambda_away, max_goals=10):
-    # precompute PMFs for perf; normalize defensively
-    ph = [poisson_prob(lambda_home, h) for h in range(max_goals + 1)]
-    pa = [poisson_prob(lambda_away, a) for a in range(max_goals + 1)]
-    p_home = 0.0
-    p_draw = 0.0
-    p_away = 0.0
-    for h in range(max_goals + 1):
-        for a in range(max_goals + 1):
-            p = ph[h] * pa[a]
-            if h > a:
-                p_home += p
-            elif h == a:
-                p_draw += p
-            else:
-                p_away += p
-    s = p_home + p_draw + p_away
-    if s > 0:
-        p_home, p_draw, p_away = p_home / s, p_draw / s, p_away / s
-    return p_home, p_draw, p_away
-
-def fair_odds(p):
-    return (1.0 / p) if p > 0 else float("inf")
-
-def to_london(dt_iso):
-    # Convert API ISO string to Europe/London datetime and label
-    try:
-        t = dt.datetime.fromisoformat(str(dt_iso).replace("Z", "+00:00"))
-        if t.tzinfo is None:
-            # assume UTC if naive
-            t = t.replace(tzinfo=dt.timezone.utc)
-        if ZoneInfo is not None:
-            t = t.astimezone(ZoneInfo("Europe/London"))
-        return t, t.strftime("%Y-%m-%d"), t.strftime("%a %d %b %H:%M")
-    except Exception:
-        return None, "?", str(dt_iso)
-
-def now_london():
-    try:
-        if ZoneInfo is not None:
-            return dt.datetime.now(ZoneInfo("Europe/London"))
-    except Exception:
-        pass
-    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
-
-def today_london_date():
-    try:
-        if ZoneInfo is not None:
-            return dt.datetime.now(ZoneInfo("Europe/London")).date()
-    except Exception:
-        pass
-    return dt.datetime.utcnow().date()
-
-def week_bounds_london_monday(ref_date=None):
-    if ref_date is None:
-        ref_date = today_london_date()
-    monday = ref_date - dt.timedelta(days=ref_date.weekday())
-    sunday = monday + dt.timedelta(days=6)
-    return monday, sunday
-
-def parse_season(value):
-    s = str(value).strip().replace(" ", "").replace("-", "/")
-    start = s.split("/")[0] if "/" in s else s
-    if not start.isdigit():
-        today = dt.date.today()
-        return today.year if today.month >= 7 else today.year - 1
-    n = int(start)
-    return n + 2000 if n < 100 else n
-
-def season_week(season_start_year, ref_date=None):
-    if ref_date is None:
-        ref_date = dt.date.today()
-    season_anchor = dt.date(season_start_year, 7, 1)
-    offset = (7 - season_anchor.weekday()) % 7
-    first_monday = season_anchor + dt.timedelta(days=offset)
-    if ref_date < first_monday:
-        return 1
-    return ((ref_date - first_monday).days // 7) + 1
-
-def form_symbols(results):
-    # simple W D L chips as text for now
-    return " ".join(results)
-
-def wdl_from_rows(rows):
-    out = []
-    for r in rows[-5:]:
-        if r.get("gf", 0) > r.get("ga", 0):
-            out.append("W")
-        elif r.get("gf", 0) < r.get("ga", 0):
-            out.append("L")
-        else:
-            out.append("D")
-    return out
-
-def wdl_from_h2h(h2h_rows):
-    home_res, away_res = [], []
-    for r in h2h_rows[-5:]:
-        hg = r.get("hg", 0)
-        ag = r.get("ag", 0)
-        if hg > ag:
-            home_res.append("W"); away_res.append("L")
-        elif hg < ag:
-            home_res.append("L"); away_res.append("W")
-        else:
-            home_res.append("D"); away_res.append("D")
-    return home_res, away_res
-
-# ---------------- LIVE DATA (API-Football) ----------------
-API_KEY = st.secrets.get("API_FOOTBALL_KEY", "")
-DIRECT_HOST = st.secrets.get("API_FOOTBALL_HOST", "v3.football.api-sports.io")
-RAPID_HOST = "api-football-v1.p.rapidapi.com"
-
-def api_providers():
-    # tuple of (base_url, headers)
-    return [
-        ("https://" + DIRECT_HOST, {"x-apisports-key": API_KEY}),
-        ("https://" + RAPID_HOST + "/v3", {"x-rapidapi-key": API_KEY, "x-rapidapi-host": RAPID_HOST}),
-    ]
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def api_get(path, params=None):
-    if (not API_KEY) or (requests is None):
-        return None, "no_key_or_requests"
-    params = params or {}
-    last_err = None
-    for base_url, hdrs in api_providers():
-        try:
-            r = requests.get(base_url + path, headers=hdrs, params=params, timeout=25)
-            if r.status_code == 200:
-                j = r.json()
-                return j.get("response", []), None
-            last_err = "{} {}".format(r.status_code, str(r.text)[:200])
-        except Exception as e:
-            last_err = str(e)
-    return None, last_err or "unknown_error"
-
-def apifb_countries():
-    resp, err = api_get("/countries")
-    if not resp:
-        return []
-    names = [r.get("name") for r in resp if r.get("name")]
-    out, seen = [], set()
-    for n in names:
-        if n not in seen:
-            out.append(n); seen.add(n)
-    return sorted(out)
-
-def apifb_leagues(country, type_filter):
-    resp, err = api_get("/leagues", {"country": country})
-    resp = resp or []
-    rows = []
-    for item in resp:
-        league = item.get("league", {})
-        if league.get("type") != type_filter:
-            continue
-        rows.append({
-            "id": league.get("id"),
-            "name": league.get("name"),
-            "seasons": item.get("seasons", []),  # list of dicts with "year"
-        })
-    # unique by (id, name)
-    uniq, seen = [], set()
-    for r in rows:
-        key = (r.get("id"), r.get("name"))
-        if key not in seen:
-            uniq.append(r); seen.add(key)
-    return uniq
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def apifb_fixtures_range(league_id, season_start_year, date_from, date_to):
-    # Pull fixtures for a date range (YYYY-MM-DD). Ask API for Europe/London timezone.
-    resp, err = api_get("/fixtures", {
-        "league": league_id,
-        "season": season_start_year,
-        "from": date_from,
-        "to": date_to,
-        "timezone": "Europe/London",
-    })
-    return (resp or []), err
-
-def season_bounds(season_start_year):
-    # July 1 to June 30 of next year (covers most leagues; safe wide net)
-    start = dt.date(season_start_year, 7, 1)
-    end   = dt.date(season_start_year + 1, 6, 30)
-    return start, end
-
-def apifb_row_basic(r):
-    teams = r.get("teams", {})
-    fixture = r.get("fixture", {})
-    iso = fixture.get("date", "")
-    t_london, date_key, label = to_london(iso)
-    return {
-        "kickoff_iso": iso,
-        "kickoff_label": label,
-        "kickoff_dt_london": t_london,
-        "date_key": date_key,  # YYYY-MM-DD in London
-        "home": (teams.get("home") or {}).get("name", "?"),
-        "away": (teams.get("away") or {}).get("name", "?"),
-        "home_id": (teams.get("home") or {}).get("id"),
-        "away_id": (teams.get("away") or {}).get("id"),
-        "raw": r,
-    }
-
-# ---------------- DEMO data (fallback) ----------------
-DEMO_COUNTRIES = ["England", "Spain"]
-DEMO_LEAGUES = {
-    "England": ["Premier League", "Championship"],
-    "Spain": ["La Liga"]
-}
-DEMO_CUPS = {
-    "England": ["FA Cup"],
-    "Spain": ["Copa del Rey"]
-}
-
-def demo_row(days, home, away):
-    # tz-aware UTC, then convert in to_london
-    utc_dt = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)
-    iso = utc_dt.isoformat()
-    t_london, date_key, label = to_london(iso)
-    return {
-        "kickoff_iso": iso,
-        "kickoff_label": label,
-        "kickoff_dt_london": t_london,
-        "date_key": date_key,
-        "home": home,
-        "away": away,
-        "raw": {},
-    }
-
-DEMO_FIX_SEASON = {
-    ("League","England","Premier League", 2025): [
-        demo_row(1,"Arsenal","Chelsea"), demo_row(1,"Liverpool","Tottenham"), demo_row(2,"Man City","Newcastle")
-    ],
-    ("League","England","Championship", 2025): [
-        demo_row(1,"Leeds","Leicester"), demo_row(2,"Southampton","Norwich"), demo_row(3,"Sunderland","Ipswich")
-    ],
-    ("League","Spain","La Liga", 2025): [
-        demo_row(1,"Real Madrid","Sevilla"), demo_row(2,"Barcelona","Valencia")
-    ],
-    ("Cup","England","FA Cup", 2025): [
-        demo_row(4,"Everton","West Ham")
-    ],
-    ("Cup","Spain","Copa del Rey", 2025): [
-        demo_row(5,"Real Sociedad","Betis")
-    ],
-}
-
-DEMO_FORM = {
-    ("Arsenal","Chelsea"): {
-        "home_home": [{"gf":2,"ga":0},{"gf":1,"ga":1},{"gf":3,"ga":2},{"gf":0,"ga":0},{"gf":2,"ga":1}],
-        "away_away": [{"gf":1,"ga":2},{"gf":0,"ga":1},{"gf":2,"ga":2},{"gf":1,"ga":3},{"gf":0,"ga":0}],
-        "h2h": [{"hg":2,"ag":1},{"hg":0,"ag":0},{"hg":3,"ag":0},{"hg":1,"ag":2},{"hg":1,"ag":1}],
-    },
-    ("Liverpool","Tottenham"): {
-        "home_home": [{"gf":3,"ga":1},{"gf":2,"ga":0},{"gf":2,"ga":1},{"gf":1,"ga":0},{"gf":4,"ga":2}],
-        "away_away": [{"gf":2,"ga":2},{"gf":1,"ga":1},{"gf":0,"ga":1},{"gf":2,"ga":3},{"gf":1,"ga":1}],
-        "h2h": [{"hg":2,"ag":2},{"hg":3,"ag":1},{"hg":1,"ag":0},{"hg":2,"ag":1},{"hg":1,"ag":1}],
+    # precompute PMFs; normalize defensively
+    ph = [poisson_prob(lambda_home,},{"hg":2,"ag":1},{"hg":1,"ag":1}],
     },
     ("Man City","Newcastle"): {
         "home_home": [{"gf":4,"ga":1},{"gf":2,"ga":0},{"gf":5,"ga":2},{"gf":1,"ga":0},{"gf":3,"ga":1}],
