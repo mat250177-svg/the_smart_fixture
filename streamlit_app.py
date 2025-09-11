@@ -1,451 +1,300 @@
-# The Smart Fixture (Tablet-Friendly, No CSS, No f-strings)
-# Live fixtures with season + date picker and season-long reel.
-# Uses API-Football if a key is present in Streamlit Secrets; otherwise demo data.
-# ASCII-only, no custom CSS, no f-strings.
-
-import json
-import math
-import datetime as dt
-import pandas as pd
+# app.py — AI Football Predictor (Poisson + Dixon–Coles + Elo ensemble)
+import pandas as pd, numpy as np
+from math import factorial
+from datetime import datetime
 import streamlit as st
 
-# Optional imports for live API and timezone
-try:
-    import requests
-except Exception:
-    requests = None
+st.set_page_config(page_title="AI Football Predictor — Pro", page_icon="⚽", layout="wide")
+st.title("⚽ AI Football Predictor — Pro")
+st.caption("Upload historical results → Poisson + Dixon–Coles + Elo → single & batch predictions with Kelly")
 
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None  # fallback if not available
-
-st.set_page_config(page_title="The Smart Fixture", layout="wide")
-
-APP_TITLE = "The Smart Fixture - Research Only"
-DISCLAIMER = (
-    "This is a research app, not a prediction or tipster service. "
-    "We do not take bets. Prices change quickly. 18+ | BeGambleAware.org"
-)
-
-# ---------------- Header ----------------
-col1, col2 = st.columns([1, 9])
-with col1:
+# ---------- Utils ----------
+def parse_date(s):
     try:
-        st.image("smart_fixture_shield_512_lime.png", width=64)
-    except Exception:
-        st.write("⚽")
-with col2:
-    st.title(APP_TITLE)
-    st.caption(DISCLAIMER)
-st.write("✅ App loaded")
-
-# ---------------- helpers ----------------
-def avg(lst):
-    return sum(lst) / len(lst) if lst else 0.0
-
-def poisson_prob(lmbda, k):
-    return math.exp(-lmbda) * (lmbda ** k) / math.factorial(k)
-
-def match_probs(lambda_home, lambda_away, max_goals=10):
-    # precompute PMFs; normalize defensively
-    ph = [poisson_prob(lambda_home, h) for h in range(max_goals + 1)]
-    pa = [poisson_prob(lambda_away, a) for a in range(max_goals + 1)]
-    p_home = 0.0
-    p_draw = 0.0
-    p_away = 0.0
-    for h in range(max_goals + 1):
-        for a in range(max_goals + 1):
-            p = ph[h] * pa[a]
-            if h > a:
-                p_home += p
-            elif h == a:
-                p_draw += p
-            else:
-                p_away += p
-    s = p_home + p_draw + p_away
-    if s > 0:
-        p_home, p_draw, p_away = p_home / s, p_draw / s, p_away / s
-    return p_home, p_draw, p_away
-
-def fair_odds(p):
-    return (1.0 / p) if p > 0 else float("inf")
-
-def to_london(dt_iso):
-    # Convert API ISO string to Europe/London datetime and label
-    try:
-        t = dt.datetime.fromisoformat(str(dt_iso).replace("Z", "+00:00"))
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=dt.timezone.utc)
-        if ZoneInfo is not None:
-            t = t.astimezone(ZoneInfo("Europe/London"))
-        return t, t.strftime("%Y-%m-%d"), t.strftime("%a %d %b %H:%M")
-    except Exception:
-        return None, "?", str(dt_iso)
-
-def now_london():
-    try:
-        if ZoneInfo is not None:
-            return dt.datetime.now(ZoneInfo("Europe/London"))
-    except Exception:
-        pass
-    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
-
-def today_london_date():
-    try:
-        if ZoneInfo is not None:
-            return dt.datetime.now(ZoneInfo("Europe/London")).date()
-    except Exception:
-        pass
-    return dt.datetime.utcnow().date()
-
-def parse_season(value):
-    s = str(value).strip().replace(" ", "").replace("-", "/")
-    start = s.split("/")[0] if "/" in s else s
-    if not start.isdigit():
-        today = dt.date.today()
-        return today.year if today.month >= 7 else today.year - 1
-    n = int(start)
-    return n + 2000 if n < 100 else n
-
-def form_symbols(results):
-    # simple W D L chips as text for now
-    return " ".join(results)
-
-def wdl_from_rows(rows):
-    out = []
-    for r in rows[-5:]:
-        gf = r.get("gf", 0)
-        ga = r.get("ga", 0)
-        if gf > ga:
-            out.append("W")
-        elif gf < ga:
-            out.append("L")
-        else:
-            out.append("D")
-    return out
-
-def wdl_from_h2h(h2h_rows):
-    home_res, away_res = [], []
-    for r in h2h_rows[-5:]:
-        hg = r.get("hg", 0)
-        ag = r.get("ag", 0)
-        if hg > ag:
-            home_res.append("W")
-            away_res.append("L")
-        elif hg < ag:
-            home_res.append("L")
-            away_res.append("W")
-        else:
-            home_res.append("D")
-            away_res.append("D")
-    return home_res, away_res
-
-# ---------------- LIVE DATA (API-Football) ----------------
-API_KEY = st.secrets.get("API_FOOTBALL_KEY", "")
-DIRECT_HOST = st.secrets.get("API_FOOTBALL_HOST", "v3.football.api-sports.io")
-RAPID_HOST = "api-football-v1.p.rapidapi.com"
-
-def api_providers():
-    # tuple of (base_url, headers)
-    return [
-        ("https://" + DIRECT_HOST, {"x-apisports-key": API_KEY}),
-        ("https://" + RAPID_HOST + "/v3", {"x-rapidapi-key": API_KEY, "x-rapidapi-host": RAPID_HOST}),
-    ]
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def api_get(path, params=None):
-    if (not API_KEY) or (requests is None):
-        return None, "no_key_or_requests", None
-    params = params or {}
-    last_err = None
-    for base_url, hdrs in api_providers():
-        try:
-            r = requests.get(base_url + path, headers=hdrs, params=params, timeout=25)
-            if r.status_code == 200:
-                j = r.json()
-                return j.get("response", []), None, base_url
-            last_err = "{} {} (via {})".format(r.status_code, str(r.text)[:200], base_url)
-        except Exception as e:
-            last_err = "{} (via {})".format(str(e), base_url)
-    return None, last_err or "unknown_error", None
-
-def apifb_countries():
-    resp, err, prov = api_get("/countries")
-    if not resp:
-        return []
-    names = [r.get("name") for r in resp if r.get("name")]
-    out, seen = [], set()
-    for n in names:
-        if n not in seen:
-            out.append(n)
-            seen.add(n)
-    return sorted(out)
-
-def apifb_leagues(country, type_filter):
-    resp, err, prov = api_get("/leagues", {"country": country})
-    resp = resp or []
-    rows = []
-    for item in resp:
-        league = item.get("league", {})
-        if league.get("type") != type_filter:
-            continue
-        rows.append({
-            "id": league.get("id"),
-            "name": league.get("name"),
-            "seasons": item.get("seasons", []),
-        })
-    uniq, seen = [], set()
-    for r in rows:
-        key = (r.get("id"), r.get("name"))
-        if key not in seen:
-            uniq.append(r)
-            seen.add(key)
-    return uniq
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def apifb_fixtures_range(league_id, season_start_year, date_from, date_to):
-    # Ask API for Europe/London timezone
-    resp, err, prov = api_get("/fixtures", {
-        "league": league_id,
-        "season": season_start_year,
-        "from": date_from,
-        "to": date_to,
-        "timezone": "Europe/London",
-    })
-    return (resp or []), err, prov
-
-def season_bounds(season_start_year):
-    # July 1 to June 30 of next year (covers most European leagues)
-    start = dt.date(season_start_year, 7, 1)
-    end = dt.date(season_start_year + 1, 6, 30)
-    return start, end
-
-def apifb_row_basic(r):
-    teams = r.get("teams", {})
-    fixture = r                p_draw += p
-            else:
-                p_away += p
-    s = p_home + p_draw + p_away
-    if s > 0:
-        p_home, p_draw, p_away = p_home / s, p_draw / s, p_away / s
-    return p_home, p_draw, p_away
-
-TEAM_NEWS = {
-    "Arsenal": [{"name":"Player A","yc":2,"s":0},{"name":"Player B","yc":4,"s":1}],
-    "Chelsea": [{"name":"Player C","yc":1,"s":0}],
-    "Liverpool": [{"name":"Player D","yc":3,"s":0},{"name":"Player E","yc":5,"s":2}],
-    "Tottenham": [{"name":"Player F","yc":2,"s":0}],
-    "Man City": [{"name":"Player G","yc":1,"s":0}],
-    "Newcastle": [{"name":"Player H","yc":4,"s":0}],
-    "Real Madrid": [{"name":"Player I","yc":2,"s":0}],
-    "Sevilla": [{"name":"Player J","yc":3,"s":1}],
-    "Barcelona": [{"name":"Player K","yc":1,"s":0}],
-    "Valencia": [{"name":"Player L","yc":2,"s":0}],
-}
-
-# ---------------- UI: competition, season, date, match ----------------
-st.subheader("Choose competition")
-c1, c2, c3, c4 = st.columns([1,1,1,1])
-
-has_key = bool(API_KEY) and (requests is not None)
-countries = apifb_countries() if has_key else DEMO_COUNTRIES
-if not countries:
-    countries = DEMO_COUNTRIES
-
-country = c1.selectbox("Country", countries, index=0)
-
-if has_key:
-    league_rows = apifb_leagues(country, "League") or [{"id":None, "name":"-", "seasons":[]}]
-    cup_rows    = apifb_leagues(country, "Cup")    or []
-else:
-    league_rows = [{"id":None, "name":n, "seasons":[{"year":2025}]} for n in DEMO_LEAGUES.get(country, [])]
-    cup_rows    = [{"id":None, "name":n, "seasons":[{"year":2025}]} for n in DEMO_CUPS.get(country, [])]
-
-league_names = [r.get("name", "-") for r in league_rows] or ["-"]
-cup_names    = ["- None -"] + [r.get("name", "-") for r in cup_rows]
-
-league_name = c2.selectbox("League", league_names, index=0)
-cup_name    = c3.selectbox("Cup", cup_names, index=0)
-
-# seasons list comes from chosen competition row
-def get_season_options(rows, name):
-    yrs = []
-    for r in rows:
-        if r.get("name") == name:
-            for s in r.get("seasons", []):
-                y = s.get("year")
-                if isinstance(y, int):
-                    yrs.append(y)
-    yrs = sorted(list(set(yrs)), reverse=True)
-    if not yrs:
-        yrs = [parse_season("2025/26")]
-    return yrs
-
-if cup_name != "- None -":
-    season_options = get_season_options(cup_rows, cup_name)
-else:
-    season_options = get_season_options(league_rows, league_name)
-
-season = c4.selectbox("Season (start year)", season_options, index=0)
-
-def find_row(rows, name):
-    for r in rows:
-        if r.get("name") == name:
-            return r
+        return datetime.fromisoformat(str(s))
+    except:
+        for fmt in ("%Y-%m-%d","%d/%m/%Y","%d-%m-%Y","%m/%d/%Y"):
+            try:
+                return datetime.strptime(str(s), fmt)
+            except:
+                pass
     return None
 
-comp_row = find_row(cup_rows, cup_name) if cup_name != "- None -" else find_row(league_rows, league_name)
-league_id = (comp_row or {}).get("id")
+def poisson_pmf(k, lam): 
+    return np.exp(-lam) * (lam ** k) / factorial(k)
 
-# Fetch fixtures for the entire season (live or demo)
-st.subheader("Pick a match")
+def score_matrix(lh, la, max_goals=6):
+    ph = [poisson_pmf(i, lh) for i in range(max_goals+1)]
+    pa = [poisson_pmf(j, la) for j in range(max_goals+1)]
+    M = np.outer(ph, pa)
+    return M / M.sum()
 
-using_demo = False
-api_err = None
-season_rows = []
+def outcome_probs(M):
+    home_win = np.tril(M, -1).sum()
+    draw = np.trace(M)
+    away_win = np.triu(M, 1).sum()
+    return float(home_win), float(draw), float(away_win)
 
-if has_key and league_id:
-    season_start, season_end = season_bounds(season)
-    api_rows, api_err = apifb_fixtures_range(league_id, season, season_start.isoformat(), season_end.isoformat())
-    if api_rows:
-        season_rows = [apifb_row_basic(r) for r in api_rows]
-    else:
-        using_demo = True
+def fair_odds(p): 
+    return np.inf if p==0 else 1.0/p
+
+def kelly_fraction(p, odds, b=None):
+    if p <= 0 or p >= 1 or odds <= 1:
+        return 0.0
+    if b is None:
+        b = odds - 1.0
+    q = 1 - p
+    f = (b*p - q) / b
+    return max(0.0, f)
+
+def clamp(x, lo, hi): 
+    return max(lo, min(hi, x))
+
+def dc_adjust_matrix(M, rho=0.05):
+    # Dixon–Coles low-score correlation tweak
+    M = M.copy()
+    if M.shape[0] < 2 or M.shape[1] < 2:
+        return M
+    M[0,0] *= (1 + rho)
+    M[0,1] *= (1 - rho)
+    M[1,0] *= (1 - rho)
+    M[1,1] *= (1 + rho)
+    return M / M.sum()
+
+def elo_probs(elo_h, elo_a, home_adv=50.0, scale=400.0, draw_width=0.22):
+    # Convert Elo difference to H/D/A with a simple draw heuristic
+    diff = (elo_h + home_adv) - elo_a
+    p_home = 1.0 / (1.0 + 10 ** (-diff/scale))
+    p_away = 1.0 - p_home
+    mid = 4 * p_home * p_away      # max 1 at perfect balance
+    p_draw = draw_width * mid
+    rem = max(1e-9, 1 - p_draw)
+    p_home, p_away = p_home*rem, p_away*rem
+    s = p_home + p_draw + p_away
+    return p_home/s, p_draw/s, p_away/s
+
+def build_elos(frame, k=20.0, home_adv=50.0, scale=400.0, init=1500.0):
+    elos = {}
+    for _,row in frame.sort_values('date_parsed').iterrows():
+        h, a = row['home'], row['away']
+        gh, ga = row['home_goals'], row['away_goals']
+        elos.setdefault(h, init)
+        elos.setdefault(a, init)
+        ph, pd, pa = elo_probs(elos[h], elos[a], home_adv=home_adv, scale=scale, draw_width=0.22)
+        if   gh > ga: r_h, r_a = 1.0, 0.0
+        elif gh == ga: r_h, r_a = 0.5, 0.5
+        else:         r_h, r_a = 0.0, 1.0
+        elos[h] += k * (r_h - ph)
+        elos[a] += k * (r_a - pa)
+    return elos
+
+# ---------- Data upload ----------
+st.subheader("1) Upload historical results")
+hist = st.file_uploader("CSV columns (required): date,home,away,home_goals,away_goals  • (optional): competition", type=["csv"])
+
+if hist is None:
+    st.info("No file uploaded. Using a tiny demo dataset so you can try it now.")
+    from io import StringIO
+    demo = StringIO("""date,home,away,home_goals,away_goals,competition
+2025-08-01,Alpha FC,Beta United,2,1,League
+2025-08-08,Alpha FC,Gamma Town,3,1,League
+2025-08-15,Beta United,Gamma Town,0,0,League
+2025-08-22,Gamma Town,Alpha FC,1,2,League
+2025-08-29,Beta United,Alpha FC,1,2,League
+2025-09-05,Gamma Town,Beta United,2,2,League
+""")
+    df = pd.read_csv(demo)
 else:
-    using_demo = True
+    df = pd.read_csv(hist)
 
-if using_demo:
-    key = ("Cup", country, cup_name, season) if (cup_name and cup_name != "- None -") else ("League", country, league_name, season)
-    season_rows = DEMO_FIX_SEASON.get(key, [])
+df.columns = [c.strip().lower() for c in df.columns]
+req = ['date','home','away','home_goals','away_goals']
+missing = [c for c in req if c not in df.columns]
+if missing:
+    st.error(f"Missing required columns: {missing}")
+    st.stop()
 
-# Demo note
-if using_demo:
-    st.caption("Using demo data. Live API not available or returned no fixtures.")
-elif api_err:
-    st.warning("Live API error: {}".format(api_err))
+for c in ['home','away']:
+    df[c] = df[c].astype(str).str.strip()
+df['date_parsed'] = df['date'].apply(parse_date)
 
-if not season_rows:
-    st.warning("No fixtures found for the chosen competition and season.")
+with st.expander("Preview data"):
+    st.dataframe(df.head())
+
+# ---------- Filters & weighting ----------
+left, right = st.columns(2)
+competitions = sorted(df['competition'].dropna().unique()) if 'competition' in df.columns else []
+comp = left.selectbox("Competition filter (optional)", options=["All"] + competitions, index=0)
+last_n = left.number_input("Last N matches per team (0 = all)", min_value=0, value=0, step=1)
+half_life = right.number_input("Time-decay half-life (days, 0 = off)", min_value=0, value=90, step=5)
+dc_rho = right.slider("Dixon–Coles ρ (low-score tweak)", min_value=-0.2, max_value=0.2, value=0.05, step=0.01)
+
+dff = df.copy() if comp=="All" else df[df.get('competition','').eq(comp)].copy()
+dff = dff.sort_values('date_parsed')
+
+# Keep last N appearances per team (combined home+away)
+if last_n and last_n > 0:
+    keep_idx = set()
+    for team in sorted(set(dff['home']).union(set(dff['away']))):
+        sub = dff[(dff['home']==team) | (dff['away']==team)]
+        keep_idx |= set(sub.tail(last_n).index.tolist())
+    dff = dff.loc[sorted(list(keep_idx))]
+
+# Exponential time-decay weights
+if half_life and half_life > 0:
+    latest = dff['date_parsed'].max()
+    ages = (latest - dff['date_parsed']).dt.days.clip(lower=0)
+    weights = np.power(0.5, ages / half_life)
 else:
-    # Build date dropdown options from the season fixtures
-    by_date = {}
-    for r in season_rows:
-        by_date.setdefault(r["date_key"], []).append(r)
-    date_list = sorted(by_date.keys())
+    weights = np.ones(len(dff))
+dff = dff.assign(weight=weights)
 
-    # default date = next upcoming or first
-    today_key = today_london_date().strftime("%Y-%m-%d")
-    default_date = date_list[0]
-    for dkey in date_list:
-        if dkey >= today_key:
-            default_date = dkey
-            break
+# ---------- Build strengths ----------
+w = dff['weight'].values
+home_goals = np.sum(dff['home_goals'] * w)
+away_goals = np.sum(dff['away_goals'] * w)
+n_matches = np.sum(w) if np.sum(w)>0 else 1.0
+league_home_avg = home_goals / n_matches
+league_away_avg = away_goals / n_matches
+home_advantage = (league_home_avg / league_away_avg) if league_away_avg>0 else 1.0
 
-    tab_by_date, tab_reel = st.tabs(["By date", "Season reel"])
+home_gp = dff.groupby('home')['home'].count().rename('gp_home')
+home_gf = dff.groupby('home').apply(lambda g: np.sum(g['home_goals']*g['weight'])).rename('gf_home')
+home_ga = dff.groupby('home').apply(lambda g: np.sum(g['away_goals']*g['weight'])).rename('ga_home')
 
-    # --- By date tab ---
-    with tab_by_date:
-        date_choice = st.selectbox("Date (Europe/London)", date_list, index=date_list.index(default_date) if default_date in date_list else 0)
-        rows_for_date = sorted(by_date.get(date_choice, []), key=lambda x: x["kickoff_iso"])
+away_gp = dff.groupby('away')['away'].count().rename('gp_away')
+away_gf = dff.groupby('away').apply(lambda g: np.sum(g['away_goals']*g['weight'])).rename('gf_away')
+away_ga = dff.groupby('away').apply(lambda g: np.sum(g['home_goals']*g['weight'])).rename('ga_away')
 
-        # optional filter: only upcoming
-        only_upcoming = st.checkbox("Show upcoming only", value=True)
-        if only_upcoming:
-            now_local = now_london()
-            rows_for_date = [r for r in rows_for_date if (r.get("kickoff_dt_london") and r["kickoff_dt_london"] >= now_local)]
+teams = pd.DataFrame({'team': sorted(set(dff['home']).union(set(dff['away'])))}).set_index('team')
+teams = teams.join([home_gp, home_gf, home_ga, away_gp, away_gf, away_ga]).fillna(0.0)
 
-        def label_for(ix):
-            r = rows_for_date[ix]
-            return "{} - {} vs {}".format(r["kickoff_label"], r["home"], r["away"])
+eps = 1e-6
+teams['home_attack']   = ((teams['gf_home']+eps) / (teams['gp_home']+eps)) / (league_home_avg+eps)
+teams['home_defence']  = ((teams['ga_home']+eps) / (teams['gp_home']+eps)) / (league_away_avg+eps)
+teams['away_attack']   = ((teams['gf_away']+eps) / (teams['gp_away']+eps)) / (league_away_avg+eps)
+teams['away_defence']  = ((teams['ga_away']+eps) / (teams['gp_away']+eps)) / (league_home_avg+eps)
 
-        if rows_for_date:
-            sel_ix = st.selectbox("Match on that date", list(range(len(rows_for_date))), format_func=label_for)
-            match = rows_for_date[sel_ix]
-        else:
-            st.info("No matches on this date with the current filter.")
-            match = None
+with st.expander("Team strengths"):
+    st.dataframe(teams[['home_attack','home_defence','away_attack','away_defence']].round(3))
 
-    # --- Season-long reel tab ---
-    with tab_reel:
-        all_sorted = sorted(season_rows, key=lambda x: x["kickoff_iso"])
-        reel_labels = ["{} - {} vs {}".format(r["kickoff_label"], r["home"], r["away"]) for r in all_sorted]
+# ---------- Elo ----------
+st.subheader("Elo settings")
+ec1, ec2, ec3 = st.columns(3)
+elo_k = ec1.number_input("K-factor", min_value=1.0, value=20.0, step=1.0)
+elo_home_adv = ec2.number_input("Elo home advantage (pts)", min_value=0.0, value=50.0, step=5.0)
+elo_scale = ec3.number_input("Elo scale (denominator)", min_value=100.0, value=400.0, step=50.0)
+alpha = st.slider("Ensemble weight α (Poisson/DC share)", 0.0, 1.0, 0.6, 0.05)
+max_goals = st.slider("Max goals per side", 4, 10, 6)
 
-        # default reel position = next upcoming
-        start_ix = 0
-        for i, r in enumerate(all_sorted):
-            if r.get("date_key", "") >= today_key:
-                start_ix = i
-                break
+elos = build_elos(dff.dropna(subset=['date_parsed']), k=elo_k, home_adv=elo_home_adv, scale=elo_scale)
 
-        # safe-guard against empty list
-        if reel_labels:
-            default_label = reel_labels[start_ix]
-            reel_choice = st.select_slider("Scroll all season fixtures", options=reel_labels, value=default_label)
-            match = all_sorted[reel_labels.index(reel_choice)]
-        else:
-            st.info("No fixtures to show in reel.")
-            # do not override match picked in the other tab
+# ---------- Single Fixture ----------
+st.subheader("2) Single fixture prediction")
+c1, c2 = st.columns(2)
+home_team = c1.selectbox("Home team", options=teams.index.tolist())
+away_team = c2.selectbox("Away team", options=[t for t in teams.index.tolist() if t != home_team])
 
-    if match is not None:
-        # Unpack the chosen match
-        home, away = match["home"], match["away"]
+# Optional manual adjustments (% multipliers)
+st.caption("Optional: apply temporary attack/defence adjustments (e.g., injuries). 1.00 = no change.")
+aj1, aj2, aj3, aj4 = st.columns(4)
+home_att_adj = aj1.number_input("Home attack ×", min_value=0.5, max_value=1.5, value=1.00, step=0.01)
+home_def_adj = aj2.number_input("Home defence ×", min_value=0.5, max_value=1.5, value=1.00, step=0.01)
+away_att_adj = aj3.number_input("Away attack ×", min_value=0.5, max_value=1.5, value=1.00, step=0.01)
+away_def_adj = aj4.number_input("Away defence ×", min_value=0.5, max_value=1.5, value=1.00, step=0.01)
 
-        # --- Demo form/H2H placeholders until live stats are wired ---
-        pair = DEMO_FORM.get((home, away), {"home_home":[], "away_away":[], "h2h":[]})
-        home_form_wdl = wdl_from_rows(pair.get("home_home", []))
-        away_form_wdl = wdl_from_rows(pair.get("away_away", []))
-        h2h_home, h2h_away = wdl_from_h2h(pair.get("h2h", []))
+ha = teams.loc[home_team,'home_attack'] * home_att_adj
+hd = clamp(teams.loc[home_team,'home_defence'] * home_def_adj, 0.25, 4.0)
+aa = teams.loc[away_team,'away_attack'] * away_att_adj
+ad = clamp(teams.loc[away_team,'away_defence'] * away_def_adj, 0.25, 4.0)
 
-        # Tiny model (demo blend)
-        def estimate_expected_goals(pair_key, home_adv=0.15, blend=0.5):
-            d = DEMO_FORM.get(pair_key, {})
-            hh = d.get("home_home", []); aa = d.get("away_away", []); h2h = d.get("h2h", [])
-            home_for = avg([r.get("gf", 0) for r in hh]) if hh else 1.2
-            away_against = avg([r.get("ga", 0) for r in aa]) if aa else 1.0
-            away_for = avg([r.get("gf", 0) for r in aa]) if aa else 1.0
-            home_against = avg([r.get("ga", 0) for r in hh]) if hh else 1.0
-            form_exp_home = (home_for + away_against) / 2.0
-            form_exp_away = (away_for + home_against) / 2.0
-            h2h_home_mean = avg([r.get("hg", 0) for r in h2h]) if h2h else 1.2
-            h2h_away_mean = avg([r.get("ag", 0) for r in h2h]) if h2h else 1.0
-            exp_home = blend * h2h_home_mean + (1 - blend) * form_exp_home + home_adv
-            exp_away = blend * h2h_away_mean + (1 - blend) * form_exp_away
-            return max(0.05, min(3.5, exp_home)), max(0.05, min(3.5, exp_away))
+lam_home = league_home_avg * ha * ad * home_advantage
+lam_away = league_away_avg * aa * hd
 
-        expH, expA = estimate_expected_goals((home, away))
-        pH, pD, pA = match_probs(expH, expA)
-        result = {
-            "expected_goals_home": round(expH, 3),
-            "expected_goals_away": round(expA, 3),
-            "prob_home": round(pH, 4),
-            "prob_draw": round(pD, 4),
-            "prob_away": round(pA, 4),
-            "fair_home_odds": round(fair_odds(pH), 3),
-            "fair_draw_odds": round(fair_odds(pD), 3),
-            "fair_away_odds": round(fair_odds(pA), 3),
+M = score_matrix(lam_home, lam_away, max_goals=max_goals)
+M = dc_adjust_matrix(M, rho=dc_rho)
+pH_p, pD_p, pA_p = outcome_probs(M)
+
+elo_h = elos.get(home_team,1500.0); elo_a = elos.get(away_team,1500.0)
+pH_e, pD_e, pA_e = elo_probs(elo_h, elo_a, home_adv=elo_home_adv, scale=elo_scale, draw_width=0.22)
+
+pH = alpha*pH_p + (1-alpha)*pH_e
+pD = alpha*pD_p + (1-alpha)*pD_e
+pA = alpha*pA_p + (1-alpha)*pA_e
+
+st.write(f"**λ (xG proxy):** Home {lam_home:.3f} | Away {lam_away:.3f}")
+st.write(f"Poisson/DC → H {pH_p:.3f} • D {pD_p:.3f} • A {pA_p:.3f}")
+st.write(f"Elo → H {pH_e:.3f} • D {pD_e:.3f} • A {pA_e:.3f}")
+st.write(f"**Ensemble → H {pH:.3f} • D {pD:.3f} • A {pA:.3f}**")
+st.write(f"**Fair odds →** Home {1/pH:.2f} • Draw {1/pD:.2f} • Away {1/pA:.2f}")
+
+st.subheader("Kelly staking (optional)")
+bk1, bk2, bk3, bk4 = st.columns(4)
+odds_home = bk1.number_input("Odds - Home", min_value=1.0, value=1.0, step=0.01)
+odds_draw = bk2.number_input("Odds - Draw", min_value=1.0, value=1.0, step=0.01)
+odds_away = bk3.number_input("Odds - Away", min_value=1.0, value=1.0, step=0.01)
+bankroll = bk4.number_input("Bankroll", min_value=0.0, value=100.0, step=1.0)
+
+fH = kelly_fraction(pH, odds_home) if odds_home>1 else 0.0
+fD = kelly_fraction(pD, odds_draw) if odds_draw>1 else 0.0
+fA = kelly_fraction(pA, odds_away) if odds_away>1 else 0.0
+st.write(f"Stake (Full Kelly): Home £{fH*bankroll:.2f} • Draw £{fD*bankroll:.2f} • Away £{fA*bankroll:.2f}")
+st.caption("Tip: use Half-Kelly (halve the stakes) to reduce volatility.")
+
+with st.expander("Top 15 correct scores (Poisson/DC)"):
+    flat = [((i,j), M[i,j]) for i in range(max_goals+1) for j in range(max_goals+1)]
+    top = sorted(flat, key=lambda x: x[1], reverse=True)[:15]
+    for (i,j),p in top:
+        st.write(f"{i}-{j}: {p:.3f}")
+
+# ---------- Batch predictions ----------
+st.subheader("3) Batch predictions")
+fix = st.file_uploader("Upcoming fixtures CSV (columns: date,home,away; optional: odds_home,odds_draw,odds_away)", type=["csv"], key="fixtures")
+
+if fix is not None:
+    fixtures = pd.read_csv(fix)
+    fixtures.columns = [c.strip().lower() for c in fixtures.columns]
+    for c in ['home','away']:
+        fixtures[c] = fixtures[c].astype(str).str.strip()
+
+    out = []
+    for _,r in fixtures.iterrows():
+        h, a = r['home'], r['away']
+        if h not in teams.index or a not in teams.index:
+            continue
+        lam_h = league_home_avg * teams.loc[h,'home_attack'] * clamp(teams.loc[a,'away_defence'],0.25,4.0) * home_advantage
+        lam_a = league_away_avg * teams.loc[a,'away_attack'] * clamp(teams.loc[h,'home_defence'],0.25,4.0)
+        M2 = score_matrix(lam_h, lam_a, max_goals=max_goals)
+        M2 = dc_adjust_matrix(M2, rho=dc_rho)
+        ph_p, pd_p, pa_p = outcome_probs(M2)
+
+        elo_h = elos.get(h,1500.0); elo_a = elos.get(a,1500.0)
+        ph_e, pd_e, pa_e = elo_probs(elo_h, elo_a, home_adv=elo_home_adv, scale=elo_scale, draw_width=0.22)
+
+        ph = alpha*ph_p + (1-alpha)*ph_e
+        pdx = alpha*pd_p + (1-alpha)*pd_e
+        pa = alpha*pa_p + (1-alpha)*pa_e
+
+        row = {
+            'date': r.get('date',''),
+            'home': h, 'away': a,
+            'p_home': ph, 'p_draw': pdx, 'p_away': pa,
+            'fair_home': (1/ph) if ph>0 else np.inf,
+            'fair_draw': (1/pdx) if pdx>0 else np.inf,
+            'fair_away': (1/pa) if pa>0 else np.inf,
+            'lam_home': lam_h, 'lam_away': lam_a
         }
+        for k in ['odds_home','odds_draw','odds_away']:
+            if k in fixtures.columns and pd.notna(r.get(k, np.nan)):
+                row[k] = r[k]
+                # crude value flag: model prob > implied prob
+                implied = 1.0 / r[k] if r[k] and r[k] > 0 else np.inf
+                prob = row['p_home'] if k=='odds_home' else (row['p_draw'] if k=='odds_draw' else row['p_away'])
+                row[f'value_{k}'] = prob > (1.0 / r[k]) if r[k] and r[k] > 0 else False
+        out.append(row)
 
-        # --- Tabs with details ---
-        tab_overview, tab_form, tab_news, tab_markets = st.tabs(["Overview", "Form & H2H", "Team news", "Markets"])
-
-        with tab_overview:
-            st.json(result, expanded=False)
-            # export buttons
-            j_bytes = json.dumps(result, indent=2).encode("utf-8")
-            st.download_button("Download result JSON", data=j_bytes, file_name="smart_fixture_result.json", mime="application/json")
-
-        with tab_form:
-            st.write("{}".format(home))
-            st.write(form_symbols(home_form_wdl) + "  (last 5)")
-            st.write("{}".format(away))
-            st.write(form_symbols(away_form_wdl) + "  (last 5)")
-            st.write("Head-to-Head (last 5)")
-            st.write("{} vs {}".format(home, away))
-            st.write(form_symbols(h2h_home))
-            st.write("{} vs {}".format(away, home))
-            st.write(form_symbols(h2h_away))
-
-        with tab_news:
-            st.write("{} - team news".format(home))
-       
+    out_df = pd.DataFrame(out)
+    st.dataframe(out_df)
+    st.download_button("Download predictions.csv", out_df.to_csv(index=False).encode('utf-8'), file_name="predictions.csv", mime="text/csv")
+else:
+    st.info("Upload a fixtures CSV to run batch predictions.")
